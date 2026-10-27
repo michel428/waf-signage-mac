@@ -110,7 +110,7 @@
       this.opening = true;
       try {
         let port = null;
-        try { const ports = await navigator.serial.getPorts(); port = ports[0] || null; } catch (e) {}
+        try { const ports = await navigator.serial.getPorts(); port = ports.find(p => { const i = p.getInfo ? p.getInfo() : {}; return i.usbVendorId === 0x0403 && p !== Cec.port; }) || null; } catch (e) {}
         if (!port) port = await navigator.serial.requestPort({ filters: [{ usbVendorId: 0x0403 }] });
         await port.open({ baudRate: 250000, dataBits: 8, stopBits: 2, parity: 'none', flowControl: 'none', bufferSize: 2048 });
         this.port = port; this.writer = port.writable.getWriter(); this.fails = 0;
@@ -147,8 +147,11 @@
     }
   };
   if (navigator.serial) {
-    navigator.serial.addEventListener('disconnect', () => { Dmx.close('adaptateur débranché'); });
-    navigator.serial.addEventListener('connect', () => { HW.wantSerial(); });
+    navigator.serial.addEventListener('disconnect', (e) => {
+      if (e.target === Cec.port) Cec.close('adaptateur CEC débranché');
+      else if (e.target === Dmx.port || !e.target) Dmx.close('adaptateur débranché');
+    });
+    navigator.serial.addEventListener('connect', () => { HW.wantSerial(); HW.wantCec(); });
   }
 
   // ─────────────────────────── Ruban LED (Web Bluetooth) ───────────────────────────
@@ -254,10 +257,103 @@
     }
   };
 
+  // ─────────────────────────── TV par HDMI-CEC (adaptateur USB Pulse-Eight) ───────────────────────────
+  // Le HDMI du Mac ne transmet pas le CEC : l'adaptateur se branche entre le Mac et la TV et
+  // parle à l'appli par un port série USB (protocole de libCEC). Logique : « appareil de lecture » (adresse 4).
+  const CEC_START = 0xff, CEC_END = 0xfe, CEC_ESC = 0xfd;
+  const M = { PING: 1, SET_ACK_MASK: 10, TRANSMIT: 11, TRANSMIT_EOM: 12, TRANSMIT_IDLETIME: 13, TRANSMIT_ACK_POLARITY: 14, SET_CONTROLLED: 24,
+              ACCEPTED: 8, REJECTED: 9, TX_OK: 16, TX_FAIL_LINE: 17, TX_FAIL_ACK: 18, TX_FAIL_DATA: 19, TX_FAIL_TIMEOUT: 20 };
+  const LA = 4;                                       // adresse logique : Playback 1
+  const Cec = {
+    port: null, writer: null, status: 'aucun adaptateur CEC', opening: false, last: '', lastOk: 0,
+    msg(code, params) {
+      const out = [CEC_START, code];
+      for (const b of params || []) { if (b >= CEC_ESC) out.push(CEC_ESC, b - 3); else out.push(b); }
+      out.push(CEC_END);
+      return new Uint8Array(out);
+    },
+    async connect() {
+      if (this.port || this.opening || !navigator.serial) return;
+      this.opening = true;
+      try {
+        let port = null;
+        try { const ports = await navigator.serial.getPorts(); port = ports.find(p => { const i = p.getInfo ? p.getInfo() : {}; return i.usbVendorId === 0x2548; }) || null; } catch (e) {}
+        if (!port) port = await navigator.serial.requestPort({ filters: [{ usbVendorId: 0x2548 }] });
+        await port.open({ baudRate: 38400, dataBits: 8, stopBits: 1, parity: 'none', flowControl: 'none' });
+        this.port = port; this.writer = port.writable.getWriter();
+        this.read(port);
+        await this.raw(this.msg(M.SET_CONTROLLED, [1]));
+        await this.raw(this.msg(M.SET_ACK_MASK, [((1 << LA) >> 8) & 0xff, (1 << LA) & 0xff]));
+        this.status = 'adaptateur HDMI-CEC connecté';
+        HW.cecReady();
+      } catch (e) {
+        const m = String(e && (e.name || e.message) || e);
+        this.status = /NotFound/i.test(m) ? 'aucun adaptateur CEC' : 'adaptateur CEC illisible (' + m + ')';
+        this.port = null; this.writer = null;
+      } finally { this.opening = false; report(); }
+    },
+    async read(port) {
+      // On lit les réponses (accusés d'envoi) pour savoir si la TV a bien reçu
+      try {
+        const rd = port.readable.getReader();
+        let cur = null, esc = false;
+        for (;;) {
+          const { value, done } = await rd.read();
+          if (done) break;
+          for (const b of value) {
+            if (b === CEC_START) { cur = []; esc = false; continue; }
+            if (cur === null) continue;
+            if (b === CEC_END) { this.onMsg(cur); cur = null; continue; }
+            if (b === CEC_ESC) { esc = true; continue; }
+            cur.push(esc ? b + 3 : b); esc = false;
+          }
+        }
+      } catch (e) {}
+      if (this.port === port) this.close('adaptateur CEC débranché');
+    },
+    onMsg(m) {
+      const code = m[0] & 0x3f;
+      if (code === M.TX_OK) { this.lastOk = Date.now(); this.status = 'TV : « ' + this.last + ' » envoyé ✓'; report(); }
+      else if (code === M.TX_FAIL_ACK) { this.status = 'TV : pas de réponse (« ' + this.last + ' ») — TV compatible CEC / Anynet+ / SimpLink activé ?'; report(); }
+      else if (code >= M.TX_FAIL_LINE && code <= M.TX_FAIL_TIMEOUT) { this.status = 'TV : envoi impossible (ligne HDMI occupée)'; report(); }
+    },
+    async raw(bytes) { if (!this.writer) throw new Error('fermé'); await this.writer.write(bytes); },
+    async frame(bytes) {
+      const bc = (bytes[0] & 0x0f) === 0x0f;
+      await this.raw(this.msg(M.TRANSMIT_IDLETIME, [3]));
+      await this.raw(this.msg(M.TRANSMIT_ACK_POLARITY, [bc ? 1 : 0]));
+      for (let i = 0; i < bytes.length; i++) await this.raw(this.msg(i === bytes.length - 1 ? M.TRANSMIT_EOM : M.TRANSMIT, [bytes[i]]));
+      await new Promise(r => setTimeout(r, 400));
+    },
+    async command(cmd) {
+      if (!this.port) return;
+      const hdr = (LA << 4) | 0;                       // du Mac (4) vers la TV (0)
+      try {
+        if (cmd === 'on') {
+          this.last = 'allumer';
+          await this.frame([hdr, 0x04]);                 // Image View On : la TV s'allume
+          await this.frame([(LA << 4) | 0x0f, 0x82, 0x10, 0x00]);   // Active Source : la TV passe sur l'entrée du Mac
+        } else if (cmd === 'standby') {
+          this.last = 'mettre en veille';
+          await this.frame([hdr, 0x36]);                 // Standby
+        }
+      } catch (e) { this.close('adaptateur CEC : erreur d\'envoi'); }
+    },
+    async close(why) {
+      const p = this.port, w = this.writer;
+      this.port = null; this.writer = null;
+      try { if (w) w.releaseLock(); } catch (e) {}
+      try { if (p) await p.close(); } catch (e) {}
+      if (why) this.status = why;
+      report();
+    }
+  };
+
   // ─────────────────────────── Échanges avec l'appli ───────────────────────────
   let lastRep = '';
   function report() {
-    const s = { dmx: Dmx.status, connected: !!Dmx.port, strip: Strip.used() ? Strip.status : '', stripUsed: Strip.used(), stripReady: Strip.ready };
+    const s = { dmx: Dmx.status, connected: !!Dmx.port, strip: Strip.used() ? Strip.status : '', stripUsed: Strip.used(), stripReady: Strip.ready,
+                cec: Cec.status, cecConnected: !!Cec.port };
     const k = JSON.stringify(s);
     if (k !== lastRep) { lastRep = k; HW.status(s); }
   }
@@ -269,6 +365,8 @@
     bleConnect: () => Strip.manualConnect(),
     bleTest: () => Strip.test(),
     stripUsed: () => Strip.used(),
+    cecConnect: () => Cec.connect(),
+    cec: (cmd) => Cec.command(cmd),
     off: () => { setProgram('{}', 0); Strip.disconnect(); }
   };
   setInterval(() => { try { tick(); } catch (e) { console.error(e); } }, FRAME_MS);

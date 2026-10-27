@@ -38,6 +38,14 @@ contextBridge.exposeInMainWorld('WafApp', {
   bleConnect: () => d('bleConnect'),
   bleTest: () => d('bleTest'),
   openBluetoothSettings: () => d('openBluetoothSettings'),
+  // Vidéos gardées sur le Mac (signage.js les annonce dès le chargement de la playlist)
+  videoPrefetch: (url) => ipcRenderer.send('waf:prefetch', String(url || '')),
+  // TV par HDMI-CEC (adaptateur USB Pulse-Eight) + accès à distance
+  cecStatus: () => s('cecStatus'),
+  tvOn: () => d('tvOn'),
+  tvOff: () => d('tvOff'),
+  remoteInfo: () => s('remoteInfo'),
+  openSharing: () => d('openSharing'),
   // Commandes à distance (Monitoring)
   appRestart: () => d('appRestart'),
   reboot: () => d('reboot'),

@@ -222,6 +222,12 @@ h1{font-weight:700;font-size:calc(6.5*var(--u));line-height:1;letter-spacing:-.0
     <button class="btn chk" data-go="locset"><span>Localisation</span></button>
   </div>
   <div class="note" id="bleInfo" style="color:var(--mute)"></div>
+  <div class="checks" id="macRow" style="display:none">
+    <button class="btn chk" data-go="tvon"><span>TV : allumer</span></button>
+    <button class="btn chk" data-go="tvoff"><span>TV : mettre en veille</span></button>
+    <button class="btn chk" id="chkVnc" data-go="sharing"><span class="dot"></span><span>Accès à distance</span></button>
+  </div>
+  <div class="note" id="macInfo" style="color:var(--mute)"></div>
   <div class="note" id="updInfo" style="color:var(--mute)"></div>
   <div class="note" id="sysInfo" style="color:var(--mute)"></div>
 </section>
@@ -309,6 +315,9 @@ h1{font-weight:700;font-size:calc(6.5*var(--u));line-height:1;letter-spacing:-.0
     else if (go === 'bletest') { if (A.bleTest) { A.bleTest(); $('bleInfo').textContent = 'Ruban LED : test rouge → vert → bleu (6 s)…'; } }
     else if (go === 'btset') { if (A.openBluetoothSettings) A.openBluetoothSettings(); }
     else if (go === 'locset') { if (A.openLocationSettings) A.openLocationSettings(); }
+    else if (go === 'tvon') { if (A.tvOn) { A.tvOn(); $('macInfo').textContent = 'TV : allumage demandé…'; } }
+    else if (go === 'tvoff') { if (A.tvOff) { A.tvOff(); $('macInfo').textContent = 'TV : mise en veille demandée…'; } }
+    else if (go === 'sharing') { if (A.openSharing) A.openSharing(); }
   });
   // Retour depuis les réglages Android → mettre à jour les pastilles
   document.addEventListener('visibilitychange', function(){ if (!document.hidden) refreshChecks(); });
@@ -328,6 +337,12 @@ h1{font-weight:700;font-size:calc(6.5*var(--u));line-height:1;letter-spacing:-.0
     }
     ['chkHome','chkHome2'].forEach(function(id){ var el = $(id); if (el) el.classList.toggle('ok', h); });
     bleRefresh();
+    if (A.cecStatus && $('macRow')) {
+      $('macRow').style.display = '';
+      var vnc = A.remoteInfo ? A.remoteInfo() : '';
+      $('chkVnc').classList.toggle('ok', /actif/.test(vnc) && !/désactivé/.test(vnc));
+      $('macInfo').textContent = 'TV (HDMI-CEC) : ' + A.cecStatus() + ' · ' + vnc;
+    }
   }
   // ── Ruban LED : état mis à jour chaque seconde tant que le menu est affiché ──
   var bleTimer = null;

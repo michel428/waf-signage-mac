@@ -20,6 +20,9 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const { execFile, spawn } = require('child_process');
+const http = require('http');
+const crypto = require('crypto');
+const { Readable } = require('stream');
 
 const BASE = 'https://signage.waf-forme.fr';
 const BOOT = path.join(__dirname, 'boot.html');
@@ -200,11 +203,14 @@ let screensOff = false;
 function applyScreenPower() {
   const all = [...wins.values()].filter(w => !w.win.isDestroyed());
   const allSleeping = all.length > 0 && all.every(w => w.mode === 'player' && sleepState.get(w.key) === true);
-  if (allSleeping && !screensOff) { screensOff = true; letSleep(); execFile('pmset', ['displaysleepnow'], () => {}); }
-  else if (!allSleeping && screensOff) { screensOff = false; keepAwake(); execFile('caffeinate', ['-u', '-t', '5'], () => {}); }
+  if (allSleeping && !screensOff) { screensOff = true; lights.cec('standby'); letSleep(); setTimeout(() => execFile('pmset', ['displaysleepnow'], () => {}), 1500); }
+  else if (!allSleeping && screensOff) { screensOff = false; keepAwake(); execFile('caffeinate', ['-u', '-t', '5'], () => {}); lights.cec('on'); }
 }
 ipcMain.on('waf:sleep', (e, sleeping) => { const w = byEvent(e); if (!w) return; sleepState.set(w.key, !!sleeping); applyScreenPower(); });
-setInterval(() => { if (screensOff) execFile('pmset', ['displaysleepnow'], () => {}); }, 10 * 60 * 1000);
+setInterval(() => { if (screensOff) { lights.cec('standby'); execFile('pmset', ['displaysleepnow'], () => {}); } }, 10 * 60 * 1000);
+// Ouverture du club : TV allumées dès le premier affichage du jour (si un adaptateur CEC est branché)
+let cecOnSent = false;
+setInterval(() => { if (!screensOff && !cecOnSent && [...wins.values()].some(w => w.mode === 'player')) { cecOnSent = true; lights.cec('on'); } }, 15000);
 
 // ── Revenir seul à l'affichage (autre appli ouverte, fenêtre masquée…) ──
 const keepFront = () => cfg.keepFront !== false;
@@ -222,7 +228,8 @@ setInterval(() => {
 
 // ───────────────────────── Lumières (fenêtre cachée) ─────────────────────────
 const lights = (() => {
-  let hw = null, ready = false, st = { dmx: 'démarrage…', strip: '', stripUsed: false, stripReady: false, connected: false };
+  let hw = null, ready = false, st = { dmx: 'démarrage…', strip: '', stripUsed: false, stripReady: false, connected: false, cec: 'aucun adaptateur CEC', cecConnected: false };
+  let wantKind = 'dmx', serialChain = Promise.resolve(), lastCecTry = 0, cecWanted = null;
   let lastJson = null, lastFade = 0, seen = new Map(), bleCb = null, bleTimer = null, bleDone = true, lastSerialTry = 0;
   const hwSes = () => session.fromPartition('persist:waf-hw');
   function create() {
@@ -231,8 +238,13 @@ const lights = (() => {
     ses.setDevicePermissionHandler(() => true);
     ses.on('select-serial-port', (e, list, wc, cb) => {
       e.preventDefault();
-      const p = list.find(x => /^(0x)?0*403$/i.test(String(x.vendorId || '')) || String(x.vendorId) === '1027')
-             || list.find(x => /usbserial|FT232|FTDI|DMX/i.test((x.portName || '') + ' ' + (x.displayName || '')));
+      const vid = x => String(x.vendorId || '').toLowerCase().replace(/^0x/, '');
+      const name = x => (x.portName || '') + ' ' + (x.displayName || '');
+      const p = wantKind === 'cec'
+        // Adaptateur HDMI-CEC Pulse-Eight (USB 2548:1001/1002, port « usbmodem… »)
+        ? (list.find(x => /^0*2548$/.test(vid(x)) || vid(x) === '9544') || list.find(x => /pulse|cec/i.test(name(x))))
+        // Adaptateur DMX FTDI (USB 0403)
+        : (list.find(x => /^0*403$/.test(vid(x)) || vid(x) === '1027') || list.find(x => /usbserial|FT232|FTDI|DMX/i.test(name(x))));
       cb(p ? p.portId : '');
     });
     hw = new BrowserWindow({ show: false, width: 320, height: 200, skipTaskbar: true, focusable: false,
@@ -251,7 +263,7 @@ const lights = (() => {
     hw.loadFile(path.join(__dirname, 'hardware.html'));
   }
   const js = (code, gesture) => { if (hw && ready && !hw.isDestroyed()) hw.webContents.executeJavaScript(code, !!gesture).catch(() => {}); };
-  ipcMain.on('hw:ready', () => { ready = true; if (lastJson !== null) js('WafHW.set(' + JSON.stringify(lastJson) + ',' + lastFade + ')'); trySerial(true); });
+  ipcMain.on('hw:ready', () => { ready = true; if (lastJson !== null) js('WafHW.set(' + JSON.stringify(lastJson) + ',' + lastFade + ')'); trySerial(true); tryCec(true); });
   ipcMain.on('hw:status', (e, s) => { st = Object.assign(st, s || {}); if (process.env.WAF_DEBUG) console.log('[lumières]', JSON.stringify(st)); });
   ipcMain.on('hw:want-serial', () => trySerial(true));
   ipcMain.on('hw:want-ble', (e, f) => {
@@ -263,13 +275,29 @@ const lights = (() => {
     const names = [...seen.values()];
     e.returnValue = !names.length ? 'aucun appareil Bluetooth détecté autour du Mac' : 'ruban introuvable — vus : ' + names.slice(0, 5).join(', ') + (names.length > 5 ? '…' : '') + ' (appli Lotus fermée sur le téléphone ?)';
   });
+  // Les ouvertures de ports série passent une par une (DMX puis CEC) : le choix du port dépend de ce qu'on cherche
+  function serialJob(kind, code) {
+    serialChain = serialChain.then(() => {
+      if (!hw || !ready || hw.isDestroyed()) return;
+      wantKind = kind;
+      return hw.webContents.executeJavaScript(code, true).catch(() => {});
+    });
+  }
   function trySerial(now) {
     if (!ready || st.connected) return;
     if (!now && Date.now() - lastSerialTry < 10000) return;
     lastSerialTry = Date.now();
-    js('WafHW.serialConnect()', true);
+    serialJob('dmx', 'WafHW.serialConnect()');
   }
-  setInterval(() => trySerial(false), 10000);   // chien de garde : adaptateur absent ou perdu → nouvel essai toutes les 10 s
+  function tryCec(now) {
+    if (!ready || st.cecConnected) return;
+    if (!now && Date.now() - lastCecTry < 30000) return;
+    lastCecTry = Date.now();
+    serialJob('cec', 'WafHW.cecConnect()');
+  }
+  setInterval(() => { trySerial(false); tryCec(false); }, 10000);   // chien de garde : adaptateurs absents ou perdus → nouvel essai
+  ipcMain.on('hw:want-cec', () => tryCec(true));
+  ipcMain.on('hw:cec-ready', () => { if (cecWanted) js('WafHW.cec(' + JSON.stringify(cecWanted) + ')'); });
   return {
     start: create,
     set(json, fade) { if (json === lastJson) return; lastJson = json; lastFade = fade | 0; js('WafHW.set(' + JSON.stringify(json) + ',' + (fade | 0) + ')'); },
@@ -278,9 +306,120 @@ const lights = (() => {
     stripConnected() { return !!st.stripReady; },
     stripConnect() { js('WafHW.bleConnect()'); },
     stripTest() { js('WafHW.bleTest()'); },
-    off() { js('WafHW.off()'); }
+    off() { js('WafHW.off()'); },
+    // TV par HDMI-CEC : 'on' (allumer + passer sur le Mac) ou 'standby' (veille)
+    cec(cmd) { cecWanted = cmd; js('WafHW.cec(' + JSON.stringify(cmd) + ')'); },
+    cecStatus() { return st.cec; },
+    cecConnected() { return !!st.cecConnected; }
   };
 })();
+
+// ───────────────────────── Vidéos gardées sur le Mac ─────────────────────────
+// Chaque vidéo des playlists est téléchargée une fois sur le disque, puis lue
+// depuis le Mac : démarrage immédiat, moins de réseau, et l'affichage continue
+// même si Internet est coupé. Un petit serveur local (127.0.0.1) sert les
+// fichiers ; les requêtes vidéo du player y sont redirigées quand la copie existe.
+const vcache = (() => {
+  const VIDEO = /\.(mp4|m4v|webm|mov)(\?|$)/i;
+  const MAX_BYTES = 40 * 1024 ** 3, KEEP_FREE = 5 * 1024 ** 3, RECHECK = 6 * 3600 * 1000;
+  let dir = '', idx = {}, port = 0, queue = [], busy = false, saveT = null;
+  const key = u => crypto.createHash('sha1').update(String(u).split('#')[0]).digest('hex');
+  const ext = u => ((String(u).split('?')[0].match(/\.(mp4|m4v|webm|mov)$/i) || [, 'mp4'])[1]).toLowerCase();
+  const fileOf = k => path.join(dir, k + '.' + (idx[k] ? idx[k].ext : 'mp4'));
+  function save() { clearTimeout(saveT); saveT = setTimeout(() => { try { fs.writeFileSync(path.join(dir, 'index.json'), JSON.stringify(idx)); } catch (e) {} }, 1500); }
+  function init() {
+    dir = path.join(app.getPath('userData'), 'videos');
+    try { fs.mkdirSync(dir, { recursive: true }); idx = JSON.parse(fs.readFileSync(path.join(dir, 'index.json'), 'utf8')) || {}; } catch (e) { idx = {}; }
+    for (const k of Object.keys(idx)) if (!fs.existsSync(fileOf(k))) delete idx[k];
+    try { for (const f of fs.readdirSync(dir)) if (f.endsWith('.part')) fs.unlinkSync(path.join(dir, f)); } catch (e) {}
+    const srv = http.createServer((req, res) => {
+      const m = /^\/v\/([a-f0-9]{40})\.\w+$/.exec(req.url || ''), e = m && idx[m[1]];
+      if (!e) { res.writeHead(404); return res.end(); }
+      const f = fileOf(m[1]);
+      let st; try { st = fs.statSync(f); } catch (x) { delete idx[m[1]]; save(); res.writeHead(404); return res.end(); }
+      e.used = Date.now(); save();
+      const type = { mp4: 'video/mp4', m4v: 'video/mp4', webm: 'video/webm', mov: 'video/quicktime' }[e.ext] || 'video/mp4';
+      const head = { 'Content-Type': type, 'Accept-Ranges': 'bytes', 'Cache-Control': 'no-store', 'Access-Control-Allow-Origin': '*' };
+      const r = /^bytes=(\d*)-(\d*)$/.exec(req.headers.range || '');
+      if (r) {
+        let a = r[1] === '' ? Math.max(0, st.size - (+r[2] || 0)) : +r[1];
+        let b = r[1] !== '' && r[2] !== '' ? Math.min(+r[2], st.size - 1) : st.size - 1;
+        if (a > b || a >= st.size) { res.writeHead(416, { 'Content-Range': 'bytes */' + st.size }); return res.end(); }
+        res.writeHead(206, Object.assign(head, { 'Content-Range': `bytes ${a}-${b}/${st.size}`, 'Content-Length': b - a + 1 }));
+        if (req.method === 'HEAD') return res.end();
+        return fs.createReadStream(f, { start: a, end: b }).pipe(res);
+      }
+      res.writeHead(200, Object.assign(head, { 'Content-Length': st.size }));
+      if (req.method === 'HEAD') return res.end();
+      fs.createReadStream(f).pipe(res);
+    });
+    srv.listen(0, '127.0.0.1', () => { port = srv.address().port; });
+    srv.on('error', () => { port = 0; });
+    // Le player demande une vidéo : copie locale si elle existe, sinon réseau (et copie en arrière-plan)
+    session.defaultSession.webRequest.onBeforeRequest({ urls: ['https://*/*'] }, (d, cb) => {
+      if (port && cfg.videoCache !== false && d.resourceType === 'media' && VIDEO.test(d.url)) {
+        const k = key(d.url);
+        if (idx[k] && idx[k].done) return cb({ redirectURL: 'http://127.0.0.1:' + port + '/v/' + k + '.' + idx[k].ext });
+        prefetch(d.url);
+      }
+      cb({});
+    });
+  }
+  function prefetch(url) {
+    if (cfg.videoCache === false || !VIDEO.test(url || '') || !/^https:/.test(url)) return;
+    const k = key(url), e = idx[k];
+    if (e && e.done && Date.now() - (e.checked || 0) < RECHECK) return;
+    if (queue.includes(url)) return;
+    queue.push(url); pump();
+  }
+  async function freeBytes() {
+    const out = await run('df', ['-k', dir]); const f = (out.split('\n')[1] || '').trim().split(/\s+/);
+    return (+f[3] || 0) * 1024;
+  }
+  function evict(need) {
+    let total = Object.values(idx).reduce((a, e) => a + (e.size || 0), 0);
+    const list = Object.entries(idx).sort((a, b) => (a[1].used || 0) - (b[1].used || 0));
+    while (list.length && total + need > MAX_BYTES) { const [k, e] = list.shift(); try { fs.unlinkSync(fileOf(k)); } catch (x) {} total -= e.size || 0; delete idx[k]; }
+    save();
+  }
+  async function pump() {
+    if (busy || !queue.length) return;
+    busy = true;
+    const url = queue.shift(), k = key(url), old = idx[k];
+    try {
+      const headers = { 'User-Agent': UA_TAG() };
+      if (old && old.done && old.etag) headers['If-None-Match'] = old.etag;
+      if (old && old.done && old.lm) headers['If-Modified-Since'] = old.lm;
+      const r = await net.fetch(url, { headers });
+      if (r.status === 304 && old) { old.checked = Date.now(); save(); }
+      else if (r.ok && r.body) {
+        const len = +r.headers.get('content-length') || 0;
+        if (old && old.done && len && len === old.size && (r.headers.get('etag') || '') === (old.etag || '') && old.etag) { old.checked = Date.now(); save(); try { await r.body.cancel(); } catch (e) {} }
+        else {
+          if (len && (await freeBytes()) - len < KEEP_FREE) evict(len + KEEP_FREE);
+          const e2 = ext(url), tmp = path.join(dir, k + '.part');
+          await new Promise((res, rej) => { const ws = fs.createWriteStream(tmp); Readable.fromWeb(r.body).on('error', rej).pipe(ws).on('finish', res).on('error', rej); });
+          const size = fs.statSync(tmp).size;
+          if (len && size !== len) throw new Error('téléchargement incomplet');
+          fs.renameSync(tmp, path.join(dir, k + '.' + e2));
+          idx[k] = { url, ext: e2, size, etag: r.headers.get('etag') || '', lm: r.headers.get('last-modified') || '', checked: Date.now(), used: Date.now(), done: true };
+          evict(0); save();
+        }
+      }
+    } catch (e) { try { fs.unlinkSync(path.join(dir, k + '.part')); } catch (x) {} }
+    busy = false;
+    setTimeout(pump, 500);
+  }
+  function status() {
+    const list = Object.values(idx).filter(e => e.done);
+    return { videos: list.length, mb: Math.round(list.reduce((a, e) => a + (e.size || 0), 0) / 1048576), pending: queue.length + (busy ? 1 : 0) };
+  }
+  return { init, prefetch, status };
+})();
+
+// ───────────────────────── Accès à distance (partage d'écran macOS) ─────────────────────────
+let vncOn = null;
+function checkVnc() { execFile('nc', ['-z', '-G', '2', '127.0.0.1', '5900'], (err) => { vncOn = !err; }); }
 
 // ───────────────────────── Diagnostic du Mac (Monitoring) ─────────────────────────
 let sysInfo = {};
@@ -311,6 +450,9 @@ function deviceDiag(w) {
   }
   o.ip = ips; if (net) o.net = net;
   o.dmx = lights.status();
+  o.cec = lights.cecStatus();
+  const vc = vcache.status(); o.cache = vc.videos + ' vidéo(s) gardée(s) sur le Mac, ' + vc.mb + ' Mo' + (vc.pending ? ' (' + vc.pending + ' en cours)' : '');
+  if (vncOn !== null) o.remote = vncOn ? 'partage d\'écran actif' + (ips[0] ? ' → vnc://' + ips[0].split(':')[1] : '') : 'partage d\'écran désactivé';
   o.uptime_s = Math.round(os.uptime());
   if (!app.isPackaged || translocated()) o.warn = 'appli lancée hors du dossier Applications : mises à jour impossibles';
   return JSON.stringify(o);
@@ -336,6 +478,8 @@ ipcMain.on('waf:sync', (e, fn, a, b) => {
     case 'deviceDiag': r = deviceDiag(w); break;
     case 'systemInfo': r = 'macOS ' + (sysInfo.os || '') + ' · moteur Chrome ' + process.versions.chrome.split('.')[0] + ' · ' + (sysInfo.model || 'Mac'); break;
     case 'dmxStatus': r = lights.status(); break;
+    case 'cecStatus': r = lights.cecStatus(); break;
+    case 'remoteInfo': r = vncOn ? 'Partage d\'écran actif' : 'Partage d\'écran désactivé'; break;
     case 'bleStatus': r = lights.stripStatus(); break;
     case 'bleConnected': r = lights.stripConnected(); break;
     case 'updatesOk': r = bundleWritable(); break;
@@ -348,6 +492,7 @@ ipcMain.on('waf:sync', (e, fn, a, b) => {
   e.returnValue = r;
 });
 ipcMain.on('waf:dmx', (e, json, fade) => lights.set(String(json || '{}'), fade | 0));
+ipcMain.on('waf:prefetch', (e, url) => vcache.prefetch(String(url || '')));
 ipcMain.on('waf:do', (e, fn) => {
   const w = byEvent(e);
   if (fn === 'appRestart') return appRestart();
@@ -357,6 +502,9 @@ ipcMain.on('waf:do', (e, fn) => {
   if (fn === 'bleTest') return lights.stripTest();
   if (fn === 'openBluetoothSettings') return execFile('open', ['/System/Library/PreferencePanes/Bluetooth.prefPane'], () => {});
   if (fn === 'openSettings') return execFile('open', ['-b', 'com.apple.systempreferences'], () => {});
+  if (fn === 'openSharing') return execFile('open', ['/System/Library/PreferencePanes/SharingPref.prefPane'], () => {});
+  if (fn === 'tvOn') return lights.cec('on');
+  if (fn === 'tvOff') return lights.cec('standby');
   if (fn === 'openUpdatesPermission') { const bp = bundlePath(); return execFile('open', bp ? ['-R', bp] : ['/Applications'], () => {}); }
   if (!w) return;
   if (fn === 'start') openPlayer(w);
@@ -469,6 +617,8 @@ app.whenReady().then(async () => {
   noScreensaver();
   collectSysInfo().catch(() => {});
   setInterval(() => collectSysInfo().catch(() => {}), 3600 * 1000);
+  vcache.init();
+  checkVnc(); setInterval(checkVnc, 10 * 60 * 1000);
   lights.start();
   buildWindows();
   fetchLatest();

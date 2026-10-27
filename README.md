@@ -37,6 +37,27 @@ Pour qu'elle revienne seule après une coupure de courant :
 - **Ruban LED** : Bluetooth du Mac allumé, appli Lotus fermée sur les téléphones. Activation et réglages dans l'admin (Lumières),
   ou depuis le menu de l'écran : « Ruban LED : connecter » / « Tester le ruban ».
 
+## Vidéos gardées sur le Mac
+Chaque vidéo des playlists est téléchargée une fois sur le Mac, puis lue depuis le disque : démarrage immédiat,
+moins de réseau, et l'affichage continue même si Internet coupe. Une vidéo remplacée sur le serveur est re-téléchargée
+(vérification toutes les 6 h). Place maximale : 40 Go (les plus anciennes sont effacées), 5 Go toujours laissés libres.
+État dans le Monitoring (« Vidéos : 12 vidéo(s) gardée(s) sur le Mac, 3 400 Mo »).
+
+## TV allumées / éteintes automatiquement (HDMI-CEC)
+Le HDMI du Mac ne transmet pas les commandes de la TV : il faut un **adaptateur USB-CEC Pulse-Eight**
+(branché entre le Mac et la TV, + câble USB vers le Mac). L'appli le trouve toute seule et :
+- met la TV **en veille** quand le club ferme (mode veille du signage) ;
+- **rallume** la TV et la remet sur l'entrée du Mac à l'ouverture.
+Sur la TV, active le CEC (Samsung : *Anynet+*, LG : *SimpLink*, Sony : *Bravia Sync*, Philips : *EasyLink*).
+Test depuis le menu de l'écran : « TV : allumer » / « TV : mettre en veille ». État dans le Monitoring.
+L'appli pilote un seul adaptateur : avec deux TV, seule celle branchée sur l'adaptateur s'allume et s'éteint toute seule.
+
+## Accès à distance
+Préférences Système → **Partage** → cocher **Partage d'écran** → *Réglages de l'ordinateur…* →
+« Les utilisateurs VNC peuvent contrôler l'écran avec le mot de passe » (choisis un mot de passe).
+Depuis le PC de l'accueil : **RealVNC Viewer** (gratuit) → adresse affichée dans le Monitoring (`vnc://192.168.x.x`).
+Raccourci depuis le menu de l'écran : « Accès à distance ».
+
 ## Mises à jour automatiques
 Le Mac vérifie toutes les 30 min et installe la nouvelle version **entre 3 h et 5 h** (ou 10 min après un démarrage),
 puis l'appli redémarre d'elle-même. Depuis l'admin : Monitoring → Redémarrer… → **Installer la mise à jour**.
