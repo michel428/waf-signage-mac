@@ -1,0 +1,51 @@
+name: Build Mac
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-14
+    env:
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '20'
+
+      - name: Trouver le projet
+        run: |
+          DIR=$(dirname "$(find . -name package.json -not -path '*/node_modules/*' | head -1)")
+          echo "Projet trouvé dans : $DIR"
+          echo "PROJ=$DIR" >> $GITHUB_ENV
+
+      - name: Construire (Mac Intel, macOS 10.13+)
+        run: |
+          cd "$PROJ"
+          npm version "2.0.${{ github.run_number }}" --no-git-tag-version
+          npm install --no-audit --no-fund
+          npx electron-builder --mac zip --x64 --publish never
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          cp dist/*-mac.zip "$GITHUB_WORKSPACE/out/waf-signage-mac.zip"
+          # Image disque pour la première installation (facultative)
+          npx electron-builder --mac dmg --x64 --publish never && cp dist/*.dmg "$GITHUB_WORKSPACE/out/WAF-Signage.dmg" || echo "DMG non créé (le .zip suffit)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: waf-signage-mac
+          path: out/*
+
+      - name: Publier (Releases)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: mac-v2.0.${{ github.run_number }}
+          name: WAF Signage Mac 2.0.${{ github.run_number }}
+          files: out/*
+          make_latest: true

@@ -1,0 +1,5 @@
+node_modules/
+dist/
+
+# copies imbriquées (ne pas publier)
+waf-signage-linux/

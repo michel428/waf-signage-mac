@@ -1,0 +1,71 @@
+{
+  "name": "waf-signage-mac",
+  "productName": "WAF Signage",
+  "version": "2.0.0",
+  "description": "WAF Signage — affichage des écrans du club (Mac, macOS 10.13 High Sierra et plus)",
+  "author": "WAF Forme <contact@waf-forme.fr>",
+  "homepage": "https://signage.waf-forme.fr",
+  "license": "UNLICENSED",
+  "main": "app/main.js",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --mac zip --x64 --publish never"
+  },
+  "devDependencies": {
+    "electron": "26.6.10",
+    "electron-builder": "24.13.3"
+  },
+  "build": {
+    "appId": "fr.wafforme.signage",
+    "productName": "WAF Signage",
+    "files": [
+      "app/**/*",
+      "package.json"
+    ],
+    "directories": {
+      "buildResources": "build",
+      "output": "dist"
+    },
+    "mac": {
+      "target": [
+        {
+          "target": "zip",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "artifactName": "waf-signage-${version}-mac.${ext}",
+      "icon": "build/icon.png",
+      "category": "public.app-category.utilities",
+      "minimumSystemVersion": "10.13.0",
+      "identity": null,
+      "hardenedRuntime": false,
+      "gatekeeperAssess": false,
+      "extendInfo": {
+        "NSBluetoothAlwaysUsageDescription": "WAF Signage pilote le ruban LED Bluetooth de la salle.",
+        "NSBluetoothPeripheralUsageDescription": "WAF Signage pilote le ruban LED Bluetooth de la salle.",
+        "NSAppleEventsUsageDescription": "WAF Signage peut redémarrer le Mac à distance (Monitoring).",
+        "LSMultipleInstancesProhibited": true,
+        "NSSupportsAutomaticGraphicsSwitching": true
+      }
+    },
+    "dmg": {
+      "artifactName": "WAF-Signage-${version}.${ext}",
+      "title": "WAF Signage",
+      "contents": [
+        {
+          "x": 140,
+          "y": 180
+        },
+        {
+          "x": 400,
+          "y": 180,
+          "type": "link",
+          "path": "/Applications"
+        }
+      ]
+    },
+    "publish": null
+  }
+}
